@@ -65,7 +65,7 @@ interface Judgment {
 }
 
 function isRecord(v: unknown): v is Record<string, unknown> {
-  return typeof v === "object" && v !== null;
+  return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
 function isDiagnosis(v: unknown): v is Diagnosis {
@@ -133,11 +133,11 @@ async function callClaude(apiKey: string, messages: Message[], system?: string):
 class ContractError extends Error {}
 
 function parseJSON<T>(text: string, validate: (v: unknown) => v is T): T {
-  const clean = text.replace(/```json|```/g, "").trim();
+  const clean = text.trim();
   const start = clean.indexOf("{");
   if (start === -1) throw new ContractError("No JSON found");
   // Scan for the brace matching the first "{", skipping braces inside strings,
-  // so trailing prose after the object can't extend the slice.
+  // so markdown fences and trailing prose can't corrupt or extend the slice.
   let depth = 0;
   let inString = false;
   let escaped = false;
