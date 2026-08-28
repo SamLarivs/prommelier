@@ -27,7 +27,9 @@ A full pipeline run makes five API calls (diagnose, refine, two live runs, one j
 
 ## Stack
 
-React 18 and Vite. No backend, no database, no CSS framework. The whole app is one component file, which is deliberate: it's meant to be read.
+React 18, TypeScript, and Vite. No backend, no database, no CSS framework. The whole app is one component file, which is deliberate: it's meant to be read.
+
+The three model responses (diagnosis, rewrite, judgment) are typed interfaces, and `parseJSON` validates every response against its contract at runtime. A malformed model response fails loudly instead of half-rendering, which is the same discipline the app asks of your prompts.
 
 ## Caveats
 
