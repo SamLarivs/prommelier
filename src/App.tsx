@@ -1,18 +1,10 @@
 import { useState, useRef, useEffect } from "react";
+import type { CSSProperties, MouseEventHandler, ReactNode, MouseEvent as ReactMouseEvent } from "react";
 
 // ----------------------------------------------------------------
 // Prommelier: a blind tasting room for your prompts.
 // Pipeline: Draft -> Diagnose -> Refine -> Prove (blind A/B eval)
 // ----------------------------------------------------------------
-
-const DIMENSIONS = [
-  "Task clarity",
-  "Context",
-  "Constraints",
-  "Output format",
-  "Examples",
-  "Audience & tone",
-];
 
 const MODEL = "claude-sonnet-4-6";
 
@@ -25,8 +17,94 @@ const CARD = "#FFFFFF";
 const LINE = "#D7DDE6";
 const MUTE = "#5C6678";
 
-async function callClaude(apiKey, messages, system) {
-  const body = {
+// ---- Model response contracts ----------------------------------
+
+interface Message {
+  role: "user" | "assistant";
+  content: string;
+}
+
+interface Dimension {
+  name: string;
+  score: number;
+  finding: string;
+}
+
+interface ClarifyingQuestion {
+  q: string;
+  why: string;
+}
+
+interface Diagnosis {
+  overall: number;
+  verdict: string;
+  dimensions: Dimension[];
+  questions: ClarifyingQuestion[];
+}
+
+interface PromptChange {
+  what: string;
+  why: string;
+}
+
+interface OptimizedPrompt {
+  prompt: string;
+  changes: PromptChange[];
+}
+
+interface Criterion {
+  name: string;
+  a: number;
+  b: number;
+}
+
+interface Judgment {
+  criteria: Criterion[];
+  winner: "A" | "B" | "tie";
+  summary: string;
+}
+
+function isRecord(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+function isDiagnosis(v: unknown): v is Diagnosis {
+  return (
+    isRecord(v) &&
+    typeof v.overall === "number" &&
+    typeof v.verdict === "string" &&
+    Array.isArray(v.dimensions) &&
+    v.dimensions.every(
+      (d) => isRecord(d) && typeof d.name === "string" && typeof d.score === "number" && typeof d.finding === "string"
+    ) &&
+    Array.isArray(v.questions) &&
+    v.questions.every((q) => isRecord(q) && typeof q.q === "string" && typeof q.why === "string")
+  );
+}
+
+function isOptimized(v: unknown): v is OptimizedPrompt {
+  return (
+    isRecord(v) &&
+    typeof v.prompt === "string" &&
+    Array.isArray(v.changes) &&
+    v.changes.every((c) => isRecord(c) && typeof c.what === "string" && typeof c.why === "string")
+  );
+}
+
+function isJudgment(v: unknown): v is Judgment {
+  return (
+    isRecord(v) &&
+    (v.winner === "A" || v.winner === "B" || v.winner === "tie") &&
+    typeof v.summary === "string" &&
+    Array.isArray(v.criteria) &&
+    v.criteria.every(
+      (c) => isRecord(c) && typeof c.name === "string" && typeof c.a === "number" && typeof c.b === "number"
+    )
+  );
+}
+
+async function callClaude(apiKey: string, messages: Message[], system?: string): Promise<string> {
+  const body: { model: string; max_tokens: number; messages: Message[]; system?: string } = {
     model: MODEL,
     max_tokens: 1500,
     messages,
@@ -43,19 +121,55 @@ async function callClaude(apiKey, messages, system) {
     body: JSON.stringify(body),
   });
   if (!res.ok) throw new Error(`API error ${res.status}`);
-  const data = await res.json();
+  const data: { content?: Array<{ type: string; text?: string }> } = await res.json();
   return (data.content || [])
     .filter((b) => b.type === "text")
-    .map((b) => b.text)
+    .map((b) => b.text ?? "")
     .join("\n");
 }
 
-function parseJSON(text) {
-  const clean = text.replace(/```json|```/g, "").trim();
+// Thrown when a model response can't be parsed or fails contract validation,
+// so callers can tell "the model broke format" apart from network/API errors.
+class ContractError extends Error {}
+
+function parseJSON<T>(text: string, validate: (v: unknown) => v is T): T {
+  const clean = text.trim();
   const start = clean.indexOf("{");
-  const end = clean.lastIndexOf("}");
-  if (start === -1 || end === -1) throw new Error("No JSON found");
-  return JSON.parse(clean.slice(start, end + 1));
+  if (start === -1) throw new ContractError("No JSON found");
+  // Scan for the brace matching the first "{", skipping braces inside strings,
+  // so markdown fences and trailing prose can't corrupt or extend the slice.
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  let end = -1;
+  for (let i = start; i < clean.length; i++) {
+    const ch = clean[i];
+    if (escaped) {
+      escaped = false;
+    } else if (inString) {
+      if (ch === "\\") escaped = true;
+      else if (ch === '"') inString = false;
+    } else if (ch === '"') {
+      inString = true;
+    } else if (ch === "{") {
+      depth++;
+    } else if (ch === "}") {
+      depth--;
+      if (depth === 0) {
+        end = i;
+        break;
+      }
+    }
+  }
+  if (end === -1) throw new ContractError("No JSON found");
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(clean.slice(start, end + 1));
+  } catch {
+    throw new ContractError("Response JSON failed to parse");
+  }
+  if (!validate(parsed)) throw new ContractError("Response JSON failed contract validation");
+  return parsed;
 }
 
 // ---- Stage prompts ---------------------------------------------
@@ -126,7 +240,7 @@ Respond with ONLY a JSON object, no markdown fences:
 
 // ---- UI atoms --------------------------------------------------
 
-function ScoreBar({ score, color }) {
+function ScoreBar({ score, color }: { score: number; color: string }) {
   return (
     <div style={{ flex: 1, height: 6, background: "#E4E9F0", borderRadius: 3, overflow: "hidden" }}>
       <div
@@ -142,7 +256,7 @@ function ScoreBar({ score, color }) {
   );
 }
 
-function StageMarker({ n, label, active, done }) {
+function StageMarker({ n, label, active, done }: { n: number; label: string; active: boolean; done: boolean }) {
   return (
     <div style={{ display: "flex", alignItems: "center", gap: 8, opacity: active || done ? 1 : 0.35 }}>
       <div
@@ -180,7 +294,7 @@ function StageMarker({ n, label, active, done }) {
   );
 }
 
-function Spinner({ label }) {
+function Spinner({ label }: { label: string }) {
   return (
     <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "14px 0" }}>
       <div className="pp-spin" />
@@ -189,12 +303,20 @@ function Spinner({ label }) {
   );
 }
 
-function Btn({ children, onClick, disabled, variant = "primary", small }) {
-  const styles = {
+interface BtnProps {
+  children: ReactNode;
+  onClick?: MouseEventHandler<HTMLButtonElement>;
+  disabled?: boolean;
+  variant?: "primary" | "ghost" | "green";
+  small?: boolean;
+}
+
+function Btn({ children, onClick, disabled, variant = "primary", small }: BtnProps) {
+  const styles: CSSProperties = ({
     primary: { background: ULTRA, color: "#fff", border: "none" },
     ghost: { background: "transparent", color: INK, border: `1.5px solid ${LINE}` },
     green: { background: GREEN, color: "#fff", border: "none" },
-  }[variant];
+  } as Record<"primary" | "ghost" | "green", CSSProperties>)[variant];
   return (
     <button
       onClick={onClick}
@@ -210,16 +332,16 @@ function Btn({ children, onClick, disabled, variant = "primary", small }) {
         opacity: disabled ? 0.45 : 1,
         transition: "transform 120ms, opacity 120ms",
       }}
-      onMouseDown={(e) => !disabled && (e.currentTarget.style.transform = "scale(0.97)")}
-      onMouseUp={(e) => (e.currentTarget.style.transform = "scale(1)")}
-      onMouseLeave={(e) => (e.currentTarget.style.transform = "scale(1)")}
+      onMouseDown={(e: ReactMouseEvent<HTMLButtonElement>) => !disabled && (e.currentTarget.style.transform = "scale(0.97)")}
+      onMouseUp={(e: ReactMouseEvent<HTMLButtonElement>) => (e.currentTarget.style.transform = "scale(1)")}
+      onMouseLeave={(e: ReactMouseEvent<HTMLButtonElement>) => (e.currentTarget.style.transform = "scale(1)")}
     >
       {children}
     </button>
   );
 }
 
-function Card({ children, style }) {
+function Card({ children, style }: { children: ReactNode; style?: CSSProperties }) {
   return (
     <div
       style={{
@@ -245,16 +367,16 @@ export default function Prommelier() {
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
 
-  const [diagnosis, setDiagnosis] = useState(null);
-  const [answers, setAnswers] = useState({});
-  const [optimized, setOptimized] = useState(null);
+  const [diagnosis, setDiagnosis] = useState<Diagnosis | null>(null);
+  const [answers, setAnswers] = useState<Record<number, string>>({});
+  const [optimized, setOptimized] = useState<OptimizedPrompt | null>(null);
   const [runA, setRunA] = useState("");
   const [runB, setRunB] = useState("");
-  const [judgment, setJudgment] = useState(null);
+  const [judgment, setJudgment] = useState<Judgment | null>(null);
   const [flip, setFlip] = useState(false); // true -> A = optimized
   const [copied, setCopied] = useState(false);
   const [showOutputs, setShowOutputs] = useState(false);
-  const resultRef = useRef(null);
+  const resultRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     if (resultRef.current) resultRef.current.scrollIntoView({ behavior: "smooth", block: "start" });
@@ -262,12 +384,14 @@ export default function Prommelier() {
 
   const ready = prompt.trim() && apiKey.trim();
 
-  const fail = (e) => {
+  const fail = (e: unknown) => {
     console.error(e);
     setError(
-      String(e).includes("401")
-        ? "The API rejected that key. Double-check it and try again."
-        : "That call didn't come back clean. Try again. Model responses occasionally break format."
+      e instanceof ContractError
+        ? "The model's response didn't match the expected format. Run it again — this is usually a one-off."
+        : String(e).includes("401")
+          ? "The API rejected that key. Double-check it and try again."
+          : "That call didn't come back clean. Check your connection and try again."
     );
     setBusy("");
   };
@@ -281,7 +405,7 @@ export default function Prommelier() {
         [{ role: "user", content: `Prompt to analyze:\n<<<\n${prompt}\n>>>\n\nStated purpose (may be empty): ${purpose || "not given"}` }],
         DIAGNOSE_SYSTEM
       );
-      const d = parseJSON(text);
+      const d = parseJSON(text, isDiagnosis);
       setDiagnosis(d);
       setAnswers({});
       setStage(1);
@@ -292,10 +416,11 @@ export default function Prommelier() {
   }
 
   async function optimize() {
+    if (!diagnosis) return;
     setError("");
     setBusy("Rewriting with your answers folded in\u2026");
     try {
-      const qa = (diagnosis.questions || [])
+      const qa = diagnosis.questions
         .map((q, i) => `Q: ${q.q}\nA: ${answers[i]?.trim() || "(skipped, use an explicit sensible default)"}`)
         .join("\n\n");
       const text = await callClaude(
@@ -311,7 +436,7 @@ export default function Prommelier() {
         ],
         OPTIMIZE_SYSTEM
       );
-      const o = parseJSON(text);
+      const o = parseJSON(text, isOptimized);
       setOptimized(o);
       setStage(2);
       setBusy("");
@@ -321,6 +446,7 @@ export default function Prommelier() {
   }
 
   async function prove() {
+    if (!optimized) return;
     setError("");
     setJudgment(null);
     setShowOutputs(false);
@@ -346,7 +472,7 @@ export default function Prommelier() {
         ],
         JUDGE_SYSTEM
       );
-      const j = parseJSON(text);
+      const j = parseJSON(text, isJudgment);
       setJudgment(j);
       setStage(3);
       setBusy("");
@@ -356,6 +482,7 @@ export default function Prommelier() {
   }
 
   function copyOptimized() {
+    if (!optimized) return;
     navigator.clipboard.writeText(optimized.prompt).then(() => {
       setCopied(true);
       setTimeout(() => setCopied(false), 1600);
@@ -559,7 +686,7 @@ export default function Prommelier() {
             </Card>
 
             {/* Clarifying questions */}
-            {diagnosis.questions?.length > 0 && (
+            {diagnosis.questions.length > 0 && (
               <Card style={{ marginTop: 14 }}>
                 <div style={{ fontFamily: "'Space Grotesk', sans-serif", fontWeight: 600, fontSize: 15, marginBottom: 4 }}>
                   Answer what you can, skip the rest
@@ -619,7 +746,7 @@ export default function Prommelier() {
                 {optimized.prompt}
               </pre>
               <div style={{ marginTop: 14 }}>
-                {optimized.changes?.map((c, i) => (
+                {optimized.changes.map((c, i) => (
                   <div key={i} style={{ display: "flex", gap: 8, fontSize: 12.5, marginBottom: 6, lineHeight: 1.45 }}>
                     <span style={{ color: GREEN, fontWeight: 700 }}>+</span>
                     <span>
