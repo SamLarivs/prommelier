@@ -131,8 +131,33 @@ async function callClaude(apiKey: string, messages: Message[], system?: string):
 function parseJSON<T>(text: string, validate: (v: unknown) => v is T): T {
   const clean = text.replace(/```json|```/g, "").trim();
   const start = clean.indexOf("{");
-  const end = clean.lastIndexOf("}");
-  if (start === -1 || end === -1) throw new Error("No JSON found");
+  if (start === -1) throw new Error("No JSON found");
+  // Scan for the brace matching the first "{", skipping braces inside strings,
+  // so trailing prose after the object can't extend the slice.
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  let end = -1;
+  for (let i = start; i < clean.length; i++) {
+    const ch = clean[i];
+    if (escaped) {
+      escaped = false;
+    } else if (inString) {
+      if (ch === "\\") escaped = true;
+      else if (ch === '"') inString = false;
+    } else if (ch === '"') {
+      inString = true;
+    } else if (ch === "{") {
+      depth++;
+    } else if (ch === "}") {
+      depth--;
+      if (depth === 0) {
+        end = i;
+        break;
+      }
+    }
+  }
+  if (end === -1) throw new Error("No JSON found");
   const parsed: unknown = JSON.parse(clean.slice(start, end + 1));
   if (!validate(parsed)) throw new Error("Response JSON failed contract validation");
   return parsed;
