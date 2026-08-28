@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from "react";
-import type { CSSProperties, ReactNode, MouseEvent as ReactMouseEvent } from "react";
+import type { CSSProperties, MouseEventHandler, ReactNode, MouseEvent as ReactMouseEvent } from "react";
 
 // ----------------------------------------------------------------
 // Prommelier: a blind tasting room for your prompts.
@@ -128,10 +128,14 @@ async function callClaude(apiKey: string, messages: Message[], system?: string):
     .join("\n");
 }
 
+// Thrown when a model response can't be parsed or fails contract validation,
+// so callers can tell "the model broke format" apart from network/API errors.
+class ContractError extends Error {}
+
 function parseJSON<T>(text: string, validate: (v: unknown) => v is T): T {
   const clean = text.replace(/```json|```/g, "").trim();
   const start = clean.indexOf("{");
-  if (start === -1) throw new Error("No JSON found");
+  if (start === -1) throw new ContractError("No JSON found");
   // Scan for the brace matching the first "{", skipping braces inside strings,
   // so trailing prose after the object can't extend the slice.
   let depth = 0;
@@ -157,9 +161,14 @@ function parseJSON<T>(text: string, validate: (v: unknown) => v is T): T {
       }
     }
   }
-  if (end === -1) throw new Error("No JSON found");
-  const parsed: unknown = JSON.parse(clean.slice(start, end + 1));
-  if (!validate(parsed)) throw new Error("Response JSON failed contract validation");
+  if (end === -1) throw new ContractError("No JSON found");
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(clean.slice(start, end + 1));
+  } catch {
+    throw new ContractError("Response JSON failed to parse");
+  }
+  if (!validate(parsed)) throw new ContractError("Response JSON failed contract validation");
   return parsed;
 }
 
@@ -296,7 +305,7 @@ function Spinner({ label }: { label: string }) {
 
 interface BtnProps {
   children: ReactNode;
-  onClick?: () => void;
+  onClick?: MouseEventHandler<HTMLButtonElement>;
   disabled?: boolean;
   variant?: "primary" | "ghost" | "green";
   small?: boolean;
@@ -378,9 +387,11 @@ export default function Prommelier() {
   const fail = (e: unknown) => {
     console.error(e);
     setError(
-      String(e).includes("401")
-        ? "The API rejected that key. Double-check it and try again."
-        : "That call didn't come back clean. Try again. Model responses occasionally break format."
+      e instanceof ContractError
+        ? "The model's response didn't match the expected format. Run it again — this is usually a one-off."
+        : String(e).includes("401")
+          ? "The API rejected that key. Double-check it and try again."
+          : "That call didn't come back clean. Check your connection and try again."
     );
     setBusy("");
   };
